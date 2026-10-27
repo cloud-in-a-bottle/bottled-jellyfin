@@ -74,10 +74,12 @@ def test_anonymous_access(stack: OpenhostStack) -> None:
         assert response.status_code >= 300, f"anonymous GET {path}: {_context(stack, response)}"
         assert "jellyfin_credentials" not in response.text, f"anonymous GET {path} got the SSO shim"
     # The public paths in cloudinabottle.toml reach Jellyfin, so other clients can discover the server and log in.
-    response = requests.get(f"{stack.url}/System/Info/Public", timeout=30)
-    assert response.status_code == 200, f"anonymous GET /System/Info/Public: {_context(stack, response)}"
+    response = requests.get(f"{stack.url}/System/Info/Public", allow_redirects=False, timeout=30)
+    assert response.status_code == 200 and response.headers.get("Content-Type", "").startswith("application/json"), (
+        f"anonymous GET /System/Info/Public: {_context(stack, response)}"
+    )
     assert response.json()["Id"], response.text
-    response = requests.get(f"{stack.url}/web/", headers={"Accept": "text/html"}, timeout=30)
+    response = requests.get(f"{stack.url}/web/", headers={"Accept": "text/html"}, allow_redirects=False, timeout=30)
     assert response.status_code == 200, f"anonymous GET /web/: {_context(stack, response)}"
 
 
