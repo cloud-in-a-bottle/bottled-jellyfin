@@ -39,6 +39,7 @@ health_check = "/_healthz"
 #   * /socket                    — Jellyfin's WebSocket endpoint.
 public_paths = [
     "/_healthz",
+    "/System/",
     "/Users/AuthenticateByName",
     "/Users/Public",
     "/Users/ForgotPassword",
