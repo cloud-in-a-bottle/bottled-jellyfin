@@ -54,7 +54,8 @@ def test_owner_sso(stack: OpenhostStack) -> None:
     server = _owner_creds(stack)["Servers"][0]
     response = stack.owner_session.get(
         f"{stack.url}/Users/Me",
-        headers={"X-Emby-Token": server["AccessToken"], "Accept": "application/json"},
+        # The header the web client sends (Jellyfin 10.11 refuses the legacy X-Emby-Token by default).
+        headers={"Authorization": f'MediaBrowser Token="{server["AccessToken"]}"', "Accept": "application/json"},
         timeout=30,
     )
     assert response.status_code == 200, f"/Users/Me with the shim's token: {_context(stack, response)}"
@@ -87,5 +88,5 @@ def test_state_in_app_data(stack: OpenhostStack) -> None:
     # start.sh points Jellyfin's config and databases at the app data dir; upstream's default (/config) isn't kept.
     _wait_for_setup(stack)  # the wizard has written the config and the user database by now
     assert (stack.data_dir / "config" / "system.xml").is_file(), sorted(p.name for p in stack.data_dir.iterdir())
-    databases = sorted(p.name for p in (stack.data_dir / "data").glob("*.db"))
+    databases = sorted(p.name for p in (stack.data_dir / "data").rglob("*.db"))
     assert databases, f"no Jellyfin database under {stack.data_dir / 'data'}"
