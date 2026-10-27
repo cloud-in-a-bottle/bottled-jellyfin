@@ -45,7 +45,7 @@ ZONE_DOMAIN="${OPENHOST_ZONE_DOMAIN:-localhost}"
 APP_NAME="${OPENHOST_APP_NAME:-jellyfin}"
 APP_HOST="${APP_NAME}.${ZONE_DOMAIN}"
 
-CONFIG_DIR="$PERSIST/config"
+CONFIG_DIR="$TEMP/config"
 DATA_DIR="$PERSIST/data"
 CACHE_DIR="$PERSIST/cache"
 LOG_DIR="$PERSIST/log"
@@ -108,7 +108,7 @@ echo "[start.sh] Starting auth-proxy on 0.0.0.0:8080 -> 127.0.0.1:8096"
 export AUTH_PROXY_LISTEN_PORT="8080"
 export AUTH_PROXY_UPSTREAM_HOST="127.0.0.1"
 export AUTH_PROXY_UPSTREAM_PORT="8096"
-export AUTH_PROXY_TOKEN_FILE="$TOKEN_FILE"
+export AUTH_PROXY_TOKEN_FILE="$TOKEN_FILE.disabled"
 python3 /opt/openhost-jellyfin/auth_proxy.py &
 PROXY_PID=$!
 
