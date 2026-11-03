@@ -57,6 +57,13 @@ USER_HEADER_NAME = "X-OpenHost-User"
 # that by encoding the token's last-byte marker in the cookie.
 SEEDED_COOKIE_NAME = "openhost_jellyfin_seeded"
 
+# Bumped whenever the seeded credentials change shape, so browsers
+# seeded by an older shim get re-seeded on their next visit to /.
+# v2: LastConnectionMode=Manual.  v1 seeded mode 0 (Local) with no
+# LocalAddress, which leaves jellyfin-web 12.x stuck on its loading
+# screen ("Must supply a serverAddress").
+SHIM_VERSION = "2"
+
 HOP_BY_HOP_HEADERS = frozenset(
     h.lower()
     for h in (
@@ -141,12 +148,18 @@ def _seeded_marker(token: str) -> str:
     the marker changes and the shim re-fires for any browser that
     cached the old cookie.  We expose only the last 12 chars of
     the token, which is well below brute-force-recoverability for
-    the full token.
+    the full token.  Prefixed with SHIM_VERSION so a shim change
+    re-seeds browsers holding credentials from an older shim.
     """
-    return token[-12:]
+    return f"v{SHIM_VERSION}.{token[-12:]}"
 
 
-def _build_shim_html(public_host: str, creds: dict) -> bytes:
+# jellyfin-web's ConnectionMode enum: which address in a Servers
+# entry the client connects to.
+CONNECTION_MODE_MANUAL = 2
+
+
+def _build_shim_html(creds: dict) -> bytes:
     """Render the localStorage-priming HTML page.
 
     The page POSTs nothing — all state comes from JS-templated
@@ -158,7 +171,6 @@ def _build_shim_html(public_host: str, creds: dict) -> bytes:
     server_name = creds.get("server_name", "Jellyfin")
     user_id = creds["user_id"]
     access_token = creds["access_token"]
-    base_url = f"https://{public_host}"
     seeded_value = _seeded_marker(access_token)
 
     # We use json.dumps to safely escape strings into JS string
@@ -171,9 +183,16 @@ def _build_shim_html(public_host: str, creds: dict) -> bytes:
                 "Name": server_name,
                 "AccessToken": access_token,
                 "UserId": user_id,
-                "ManualAddress": base_url,
-                "RemoteAddress": base_url,
-                "LastConnectionMode": 0,
+                # ManualAddress and RemoteAddress are filled in by
+                # JS from window.location.origin, so the scheme and
+                # port match however the browser reached the app
+                # (https on public zones, plain http on .local).
+                "ManualAddress": "",
+                "RemoteAddress": "",
+                # The client connects to the address for this mode.
+                # Manual -> ManualAddress.  Local (0) would need a
+                # LocalAddress, which we have no use for.
+                "LastConnectionMode": CONNECTION_MODE_MANUAL,
                 "DateLastAccessed": 0,  # filled in by JS
                 "Type": "Server",
             }
@@ -222,7 +241,10 @@ def _build_shim_html(public_host: str, creds: dict) -> bytes:
   <script>
   (function () {{
     var creds = {payload_js};
-    creds.Servers[0].DateLastAccessed = Date.now();
+    var server = creds.Servers[0];
+    server.ManualAddress = window.location.origin;
+    server.RemoteAddress = window.location.origin;
+    server.DateLastAccessed = Date.now();
     try {{
       localStorage.setItem('jellyfin_credentials', JSON.stringify(creds));
     }} catch (e) {{
@@ -233,9 +255,12 @@ def _build_shim_html(public_host: str, creds: dict) -> bytes:
     }}
     // Mark this browser as seeded so subsequent visits don't re-
     // shim.  Path=/ so it covers all of Jellyfin's URLs; SameSite
-    // Lax so it survives top-level navigations.
+    // Lax so it survives top-level navigations.  Secure only over
+    // https: browsers drop Secure cookies set from plain http, which
+    // would re-run the shim on every visit to a .local zone.
     document.cookie = 'openhost_jellyfin_seeded=' + {seeded_js}
-      + '; Path=/; Max-Age=31536000; SameSite=Lax; Secure';
+      + '; Path=/; Max-Age=31536000; SameSite=Lax'
+      + (window.location.protocol === 'https:' ? '; Secure' : '');
     window.location.replace('{web_url}');
   }})();
   </script>
@@ -334,12 +359,8 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
         self._proxy()
 
     def _serve_shim(self, creds: dict) -> None:
-        public_host = self.headers.get("X-Forwarded-Host", "").strip()
-        if not public_host:
-            # Loopback diagnostics: fall back to the request's Host.
-            public_host = self.headers.get("Host", "").strip() or "localhost"
         try:
-            page = _build_shim_html(public_host, creds)
+            page = _build_shim_html(creds)
         except (KeyError, ValueError) as exc:
             log.warning("auto-shim: failed to render shim HTML: %s", exc)
             self._proxy()

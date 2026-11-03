@@ -59,6 +59,39 @@ def _generate_password() -> str:
     return "".join(secrets.choice(alphabet) for _ in range(40))
 
 
+# On first boot Jellyfin (12.x) serves a temporary setup server while
+# it migrates the database, then stops it and starts the real one a
+# few seconds later.  The setup server already answers
+# /System/Info/Public with 200, so _wait_for_jellyfin_ready can
+# return just before that gap, and the next request is refused.
+# Connection-level failures are retried for this long.
+RESTART_GAP_SECONDS = 120
+
+
+def _urlopen_through_restart(req: urllib.request.Request):
+    """urlopen, retrying while nothing is listening (Jellyfin's
+    setup-server -> server handover).  Only a refused connection is
+    retried: the request never reached Jellyfin, so retrying a POST
+    can't apply it twice."""
+    deadline = time.monotonic() + RESTART_GAP_SECONDS
+    while True:
+        try:
+            return urllib.request.urlopen(req, timeout=20)
+        except urllib.error.URLError as exc:
+            refused = isinstance(exc, ConnectionRefusedError) or isinstance(
+                getattr(exc, "reason", None), ConnectionRefusedError
+            )
+            if not refused or time.monotonic() >= deadline:
+                raise
+            print(f"[bootstrap] {req.get_method()} {req.full_url}: connection refused; retrying")
+            time.sleep(1)
+        except ConnectionRefusedError:
+            if time.monotonic() >= deadline:
+                raise
+            print(f"[bootstrap] {req.get_method()} {req.full_url}: connection refused; retrying")
+            time.sleep(1)
+
+
 def _request(
     method: str,
     path: str,
@@ -91,7 +124,7 @@ def _request(
         headers=final_headers,
     )
     try:
-        resp = urllib.request.urlopen(req, timeout=20)
+        resp = _urlopen_through_restart(req)
         status = resp.status
         resp_headers = {k.lower(): v for k, v in resp.headers.items()}
         resp_body = resp.read()
