@@ -1,20 +1,16 @@
 """OpenHost auto-login auth-proxy for Jellyfin.
 
 Sits between the OpenHost router and Jellyfin (.NET on
-127.0.0.1:8096).  When an authenticated zone owner navigates to
-``/`` (or ``/web/`` etc.) without yet having seeded Jellyfin's
-``jellyfin_credentials`` localStorage entry, the proxy serves a
-small HTML shim that:
+127.0.0.1:8096). When an authenticated zone owner visits ``/`` without a
+current seed cookie, the proxy mints a browser-specific Jellyfin device token
+on loopback and serves an HTML shim that:
 
-  1. Reads the bootstrap-generated admin AccessToken from a
-     /_owner_creds.json XHR (served by THIS proxy from an in-memory
-     copy of admin-token.json),
-  2. Writes a ``Credentials`` object containing the AccessToken,
-     UserId, server Id, and address into ``localStorage.
-     jellyfin_credentials``,
-  3. Sets a cookie ``openhost_jellyfin_seeded=1`` so subsequent
-     requests don't re-trigger the shim,
-  4. ``window.location.replace('/web/')`` to the SPA proper.
+  1. Writes a ``Credentials`` object containing that AccessToken,
+      UserId, server Id, and address into ``localStorage.
+      jellyfin_credentials``,
+  2. Sets a cookie ``openhost_jellyfin_seeded=<bootstrap-marker>`` so subsequent
+      requests don't re-trigger the shim,
+  3. ``window.location.replace('/web/')`` to the SPA proper.
 
 Jellyfin's auth model is API-key based: the SPA reads
 ``localStorage.jellyfin_credentials`` and sets
@@ -39,6 +35,8 @@ import http.client
 import json
 import logging
 import os
+import re
+import secrets
 import socket
 import sys
 import threading
@@ -53,17 +51,16 @@ USER_HEADER_NAME = "X-OpenHost-User"
 # its presence as a "the owner has been seeded on this browser"
 # marker so we don't keep re-running the shim on every navigation
 # back to /.  The cookie is per-browser, not persistent across
-# revoked tokens — if the operator rotates the admin token (delete
-# admin-token.json, restart) we want the shim to re-fire.  We do
+# revoked tokens — if the operator replaces the bootstrap token after a
+# supported rotation, we want the shim to re-fire. We do
 # that by encoding the token's last-byte marker in the cookie.
 SEEDED_COOKIE_NAME = "openhost_jellyfin_seeded"
 
 # Bumped whenever the seeded credentials change shape, so browsers
 # seeded by an older shim get re-seeded on their next visit to /.
-# v2: LastConnectionMode=Manual.  v1 seeded mode 0 (Local) with no
-# LocalAddress, which leaves jellyfin-web 12.x stuck on its loading
-# screen ("Must supply a serverAddress").
-SHIM_VERSION = "2"
+# v3: give each browser its own Jellyfin token/device so remote controls target one session.
+# v2: LastConnectionMode=Manual (v1 left jellyfin-web stuck on its loading screen).
+SHIM_VERSION = "3"
 
 HOP_BY_HOP_HEADERS = frozenset(
     h.lower()
@@ -80,6 +77,9 @@ HOP_BY_HOP_HEADERS = frozenset(
         "Content-Length",
     )
 )
+# We recalculate request Content-Length above, but must preserve the upstream response's
+# Content-Length for ranges, HEAD, and detecting an interrupted media download.
+RESPONSE_STRIP_HEADERS = HOP_BY_HOP_HEADERS - {"content-length"}
 
 ALWAYS_STRIP_HEADERS = frozenset(
     h.lower() for h in (
@@ -93,7 +93,11 @@ CLIENT_READ_TIMEOUT_SECONDS = 60
 # a WebSocket upgrade; an open tunnel has no timeout.
 WS_HANDSHAKE_TIMEOUT_SECONDS = 10
 WS_MAX_RESPONSE_HEAD_BYTES = 64 * 1024
-MAX_BODY_BYTES = 256 * 1024 * 1024  # Jellyfin streams large media
+MAX_BODY_BYTES = 256 * 1024 * 1024  # Limit request bodies; stream responses without a size cap.
+RESPONSE_CHUNK_BYTES = 64 * 1024
+MEDIA_PATH_PREFIXES = ("/items/", "/videos/", "/video/", "/audio/")
+MEDIA_TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
+MEDIA_ITEM_ID_PATTERN = re.compile(r"^[0-9a-fA-F]{32}$")
 
 logging.basicConfig(
     level=os.environ.get("AUTH_PROXY_LOG_LEVEL", "INFO"),
@@ -176,7 +180,9 @@ def _build_shim_html(creds: dict) -> bytes:
     server_name = creds.get("server_name", "Jellyfin")
     user_id = creds["user_id"]
     access_token = creds["access_token"]
-    seeded_value = _seeded_marker(access_token)
+    # The cookie tracks the bootstrap token, not the per-browser token. Otherwise a fresh
+    # token would change the marker on every navigation and mint tokens indefinitely.
+    seeded_value = creds.get("seed_marker") or _seeded_marker(access_token)
 
     # We use json.dumps to safely escape strings into JS string
     # literals; never do raw f-string interpolation of user-
@@ -281,7 +287,10 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
     token_file: str = "/data/app_data/jellyfin/admin-token.json"
 
     def log_message(self, format: str, *args) -> None:  # noqa: A002, N802
-        log.info("%s - " + format, self.address_string(), *args)
+        # Media URLs and /socket frequently carry api_key query parameters. BaseHTTPRequestHandler's
+        # default request-line log would persist those access tokens verbatim.
+        status = args[1] if format == '"%s" %s %s' and len(args) >= 2 else "-"
+        log.info("%s %s -> %s", self.command, self.path.split("?", 1)[0], status)
 
     def do_GET(self) -> None:  # noqa: N802
         self._dispatch()
@@ -358,13 +367,117 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
                     cookies.get(SEEDED_COOKIE_NAME) == expected_marker
                 )
                 if not already_seeded:
-                    self._serve_shim(creds)
+                    self._serve_shim(self._browser_creds(creds))
                     return
+
+        if not is_owner and self._is_media_path() and not self._has_valid_media_token():
+            self._safe_send_error(401, "Jellyfin authentication required")
+            return
 
         if self._is_websocket_upgrade():
             self._proxy_websocket()
             return
         self._proxy()
+
+    def _decoded_media_path(self) -> str | None:
+        path = urllib.parse.urlsplit(self.path).path
+        # The router accepts unambiguous percent-encoded public paths and the .NET
+        # backend decodes them. Check each decoded form so encoding cannot bypass auth.
+        for _ in range(8):
+            if path.lower().startswith(MEDIA_PATH_PREFIXES):
+                return path
+            decoded = urllib.parse.unquote(path)
+            if decoded == path:
+                break
+            path = decoded
+        return None
+
+    def _is_media_path(self) -> bool:
+        return self._decoded_media_path() is not None
+
+    def _has_valid_media_token(self) -> bool:
+        """Jellyfin's stream handlers allow anonymous requests, so authenticate before proxying.
+
+        Browser media requests include an Authorization header; mobile clients and shared
+        links may instead put api_key in the URL. Check with Jellyfin itself rather than
+        treating the mere presence of a token as proof of authorization.
+        """
+        authorization = self.headers.get("Authorization") or self.headers.get("X-Emby-Authorization")
+        if not authorization:
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            candidates = [value for key, values in query.items() if key.lower() in ("api_key", "apikey") for value in values]
+            token = candidates[0] if len(candidates) == 1 else ""
+            if not MEDIA_TOKEN_PATTERN.fullmatch(token):
+                return False
+            authorization = f'MediaBrowser Token="{token}"'
+
+        path = self._decoded_media_path()
+        item_id = path.split("/", 3)[2] if path else ""
+        if not MEDIA_ITEM_ID_PATTERN.fullmatch(item_id):
+            return False
+
+        conn = http.client.HTTPConnection(self.upstream_host, self.upstream_port, timeout=10)
+        try:
+            conn.request("GET", "/Users/Me", headers={"Authorization": authorization})
+            response = conn.getresponse()
+            if response.status != 200:
+                return False
+            user = json.loads(response.read(64 * 1024 + 1))
+            user_id = user.get("Id")
+            if not isinstance(user_id, str) or not MEDIA_ITEM_ID_PATTERN.fullmatch(user_id):
+                return False
+            # Jellyfin stream routes allow tokenless playback. /Items/{id} applies the
+            # user's library policy, so check it before handing out any media bytes.
+            conn.request(
+                "GET", f"/Items/{item_id}?userId={user_id}", headers={"Authorization": authorization}
+            )
+            item = conn.getresponse()
+            return item.status == 200
+        except (OSError, ValueError, http.client.HTTPException) as exc:
+            log.warning("media token validation failed: %s", type(exc).__name__)
+            return False
+        finally:
+            conn.close()
+
+    def _browser_creds(self, bootstrap: dict) -> dict:
+        """Mint a distinct Jellyfin session for this owner's browser on its first visit.
+
+        The password never leaves the container. If an older token file lacks it, or Jellyfin
+        is temporarily unavailable, the existing bootstrap token still provides owner SSO.
+        """
+        username, password = bootstrap.get("username"), bootstrap.get("password")
+        if not username or not password:
+            return bootstrap
+        device_id = "openhost-browser-" + secrets.token_urlsafe(18)
+        identity = (
+            'MediaBrowser Client="Cloud in a Bottle", Device="Browser", '
+            f'DeviceId="{device_id}", Version="1"'
+        )
+        body = json.dumps({"Username": username, "Pw": password}).encode()
+        conn = http.client.HTTPConnection(self.upstream_host, self.upstream_port, timeout=10)
+        try:
+            conn.request(
+                "POST", "/Users/AuthenticateByName", body=body,
+                headers={"Authorization": identity, "X-Emby-Authorization": identity,
+                         "Content-Type": "application/json"},
+            )
+            response = conn.getresponse()
+            result = response.read(64 * 1024 + 1)
+            if response.status != 200 or len(result) > 64 * 1024:
+                log.warning("browser token mint returned HTTP %d", response.status)
+                return bootstrap
+            parsed = json.loads(result)
+            token = parsed.get("AccessToken")
+            user_id = (parsed.get("User") or {}).get("Id")
+            if not isinstance(token, str) or not token or user_id != bootstrap["user_id"]:
+                log.warning("browser token mint returned incomplete credentials")
+                return bootstrap
+            return {**bootstrap, "access_token": token, "seed_marker": _seeded_marker(bootstrap["access_token"])}
+        except (OSError, ValueError, http.client.HTTPException) as exc:
+            log.warning("browser token mint failed: %s", type(exc).__name__)
+            return bootstrap
+        finally:
+            conn.close()
 
     def _serve_shim(self, creds: dict) -> None:
         try:
@@ -575,36 +688,29 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
                 self._safe_send_error(502, "Bad Gateway")
                 return
 
-            try:
-                payload = upstream.read(MAX_BODY_BYTES + 1)
-            except (OSError, http.client.HTTPException) as exc:
-                log.warning("upstream read error: %s", exc)
-                self._safe_send_error(502, "Bad Gateway")
-                try:
-                    upstream.close()
-                except Exception as close_exc:  # noqa: BLE001
-                    log.debug("upstream.close() raised: %s", close_exc)
-                return
-            try:
-                upstream.close()
-            except Exception as exc:  # noqa: BLE001
-                log.debug("upstream.close() raised (ignored): %s", exc)
-            if len(payload) > MAX_BODY_BYTES:
-                self._safe_send_error(502, "upstream response too large")
-                return
-
             reason = upstream.reason or ""
             try:
                 self.send_response(upstream.status, reason)
                 for key, value in upstream.getheaders():
-                    if key.lower() in HOP_BY_HOP_HEADERS:
+                    if key.lower() in RESPONSE_STRIP_HEADERS:
                         continue
                     self.send_header(key, value)
+                # http.client decodes upstream chunked transfer encoding. An unknown-length
+                # response is delimited by closing this HTTP/1.0 hop, not by copying its TE.
+                self.send_header("Connection", "close")
                 self.end_headers()
+                self.close_connection = True
                 if self.command != "HEAD":
-                    self.wfile.write(payload)
+                    while chunk := upstream.read1(RESPONSE_CHUNK_BYTES):
+                        self.wfile.write(chunk)
             except OSError as exc:
-                log.debug("client disconnected mid-response: %s", exc)
+                # Once headers have been sent a 502 cannot replace the response; close the
+                # connection so a client with Content-Length can detect the truncation.
+                log.debug("stream interrupted or client disconnected: %s", exc)
+            except http.client.HTTPException as exc:
+                log.warning("upstream stream interrupted: %s", exc)
+            finally:
+                upstream.close()
         finally:
             conn.close()
 

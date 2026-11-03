@@ -5,8 +5,9 @@ owner SSO.
 
 When the Cloud in a Bottle zone owner visits `jellyfin.<zone>` for the first time
 in a browser, an HTML shim seeds Jellyfin's `localStorage.jellyfin_credentials`
-entry with a server-minted access token, then redirects to `/web/`.  The SPA
-loads with the owner already signed in.
+entry with a browser-specific access token, then redirects to `/web/`.  The SPA
+loads with the owner already signed in. Each browser gets a distinct Jellyfin
+session, so WebSocket updates and remote-control commands target the right one.
 
 ## Topology
 
@@ -27,8 +28,9 @@ is no server-side session cookie to mint, so the standard Pattern B 302-
 with-Set-Cookie pattern (joplin, vscode, bookstack) does not work.
 
 Instead, the auth-proxy detects an owner GET on `/`, `/index.html`, or
-similar pre-SPA paths AND no `openhost_jellyfin_seeded` cookie, and serves
-a tiny HTML page that runs JS to:
+similar pre-SPA paths AND no `openhost_jellyfin_seeded` cookie. It authenticates
+to Jellyfin over container loopback with a new device ID using the password in
+`admin-token.json`, then serves a tiny HTML page that runs JS to:
 
   1. `localStorage.setItem('jellyfin_credentials', JSON.stringify(...))`
      with the server-minted token, server Id, user Id, and address.
@@ -36,22 +38,33 @@ a tiny HTML page that runs JS to:
      navigations don't re-shim.
   3. `window.location.replace('/web/')`.
 
-If the operator rotates the access token (delete `admin-token.json` and
-restart), the cookie marker changes and the shim re-fires for any browser
-that cached the old cookie.
+The cookie marker tracks the original bootstrap token, not the per-browser token,
+so repeat navigations do not mint additional sessions. If the operator replaces
+the bootstrap token, the marker changes and the shim re-fires. The v3 marker
+also re-seeds browsers that still hold an older shared token on their next `/` visit.
+If an old token file lacks the password or Jellyfin is temporarily unavailable,
+the owner can still be seeded with the bootstrap token.
+Do not delete `admin-token.json` on an already configured server as a rotation
+method: the first-boot wizard does not recreate it after setup is complete.
 
 ## Files
 
-  * `openhost.toml` — manifest.  Declares `/_healthz` health check and the
-    public paths Jellyfin needs (mobile/desktop client APIs, media stream
-    URLs that carry their own `?api_key=`, the WebSocket endpoint).
-  * `Dockerfile` — bases on `jellyfin/jellyfin:latest`, adds
+  * `cloudinabottle.toml` — manifest. Declares `/_healthz` health check and the
+    public paths Jellyfin needs (mobile/desktop client APIs, uppercase and
+    lowercase media stream URLs, the WebSocket endpoint).
+  * `Dockerfile` — bases on a pinned Jellyfin image, adds
     Python 3 + tini + gosu + curl.
   * `start.sh` — supervises Jellyfin + auth-proxy via bash `wait -n`.
     Spawns `bootstrap_admin.py` in the background to drive the startup
     wizard on first boot.
-  * `auth_proxy.py` — owner localStorage-shim sidecar.  Renders a static
-    HTML page on owner pre-SPA navigations.
+  * `auth_proxy.py` — owner localStorage-shim sidecar. Mints a distinct
+    browser token and renders the shim on owner pre-SPA navigations. It
+    streams media responses (including byte ranges and transcoded output)
+    without a 256 MiB cap, and tunnels WebSocket upgrades. For non-owner media
+    requests it verifies both the Jellyfin token and that the token's user can
+    access the requested item; Jellyfin's own stream routes can otherwise serve
+    bytes without authentication. It omits query strings from request logs so
+    shared-link API keys are never logged by the proxy.
   * `bootstrap_admin.py` — first-boot setup wizard automation.  Drives
     `POST /Startup/Configuration → /Startup/RemoteAccess → /Startup/User
     → /Startup/Complete` then mints an access token via
@@ -69,7 +82,7 @@ up — fast and POSIX-strict, so it's safe for Jellyfin's SQLite DBs):
   * `cache/` — transcode + thumbnail cache.
   * `log/` — Jellyfin logs.
   * `admin-token.json` — bootstrap-generated server id, user id, access
-    token (mode 0600).
+    token and password (mode 0600, never sent to browsers).
 
 Bulk media lives on the **archive tier** under
 `$OPENHOST_APP_ARCHIVE_DIR/` (`app_archive = true` in the manifest):
@@ -78,7 +91,8 @@ Bulk media lives on the **archive tier** under
     mounts here.  Backed by JuiceFS — local disk by default, and
     transparently offloaded to **S3** once the operator upgrades the
     zone to S3 storage from the Cloud in a Bottle dashboard.  This keeps large
-    video files off the host's local disk.
+    video files off the host's local disk. Add the archive paths as Jellyfin
+    libraries and run a library scan after copying media files in.
 
 ## Caveats
 
