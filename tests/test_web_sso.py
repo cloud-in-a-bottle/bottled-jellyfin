@@ -118,3 +118,39 @@ def test_reseeds_browser_seeded_by_old_shim(stack: OpenhostStack, page: Page) ->
     page.goto(f"{stack.url}/")
     _expect_home(page, errors)
     assert _seeded_server(page)["LastConnectionMode"] == 2
+
+
+def test_live_socket_stays_open(stack: OpenhostStack, page: Page) -> None:
+    """jellyfin-web's /socket (live updates: now playing, remote control, scan progress) connects and gets messages.
+
+    auth_proxy.py used to answer the WebSocket upgrade as plain HTTP, so Jellyfin 404'd it and the client reconnected
+    every few seconds.
+    """
+    _wait_for_admin_token(stack)
+    errors: list[str] = []
+    page.on("pageerror", lambda e: errors.append(str(e)))
+    sockets: list[dict[str, Any]] = []
+
+    def on_socket(ws: Any) -> None:
+        if "/socket" not in ws.url:
+            return
+        record: dict[str, Any] = {"frames": [], "closed": False}
+        ws.on("framereceived", lambda payload: record["frames"].append(payload))
+        ws.on("close", lambda _: record.update(closed=True))
+        sockets.append(record)
+
+    page.on("websocket", on_socket)
+    stack.playwright_login(page)
+    page.goto(f"{stack.url}/")
+    _expect_home(page, errors)
+
+    # Jellyfin greets a new session with a ForceKeepAlive message; wait for it, then make sure the socket stays up.
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline and not any(s["frames"] for s in sockets):
+        page.wait_for_timeout(500)
+    page.wait_for_timeout(10_000)
+    assert sockets, "jellyfin-web never opened /socket"
+    live = [s for s in sockets if s["frames"] and not s["closed"]]
+    assert live, f"no /socket stayed open with messages: {[(len(s['frames']), s['closed']) for s in sockets]}"
+    assert len(sockets) <= 2, f"jellyfin-web kept reconnecting /socket ({len(sockets)} connections in ~10s)"
+    assert any("ForceKeepAlive" in str(frame) for frame in live[0]["frames"]), live[0]["frames"][:3]

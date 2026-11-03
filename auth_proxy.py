@@ -41,6 +41,7 @@ import logging
 import os
 import socket
 import sys
+import threading
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import AbstractSet, Iterable
@@ -88,6 +89,10 @@ ALWAYS_STRIP_HEADERS = frozenset(
 )
 
 CLIENT_READ_TIMEOUT_SECONDS = 60
+# Bounds connecting to Jellyfin and reading its handshake response for
+# a WebSocket upgrade; an open tunnel has no timeout.
+WS_HANDSHAKE_TIMEOUT_SECONDS = 10
+WS_MAX_RESPONSE_HEAD_BYTES = 64 * 1024
 MAX_BODY_BYTES = 256 * 1024 * 1024  # Jellyfin streams large media
 
 logging.basicConfig(
@@ -356,6 +361,9 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
                     self._serve_shim(creds)
                     return
 
+        if self._is_websocket_upgrade():
+            self._proxy_websocket()
+            return
         self._proxy()
 
     def _serve_shim(self, creds: dict) -> None:
@@ -378,6 +386,129 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
         except OSError as exc:
             log.debug("client disconnected during shim response: %s", exc)
         log.info("auto-shim: served Jellyfin localStorage shim")
+
+    def _is_websocket_upgrade(self) -> bool:
+        connection_tokens = {
+            t.strip().lower() for t in self.headers.get("Connection", "").split(",")
+        }
+        return (
+            self.command == "GET"
+            and self.headers.get("Upgrade", "").strip().lower() == "websocket"
+            and "upgrade" in connection_tokens
+        )
+
+    def _proxy_websocket(self) -> None:
+        """Tunnel a WebSocket upgrade (Jellyfin's /socket) to upstream.
+
+        http.client can't carry a 101 Switching Protocols, and
+        _proxy() strips Upgrade/Connection as hop-by-hop, so upgrades
+        are forwarded over a raw socket instead: send the handshake,
+        relay upstream's response head verbatim, then pipe bytes both
+        ways until either side closes.  Frames are not parsed.
+        """
+        # The connection is dedicated to the tunnel from here on.
+        self.close_connection = True
+        headers = _strip_headers(
+            self.headers.items(),
+            HOP_BY_HOP_HEADERS | ALWAYS_STRIP_HEADERS,
+        )
+        forwarded_host = self.headers.get("X-Forwarded-Host", "").strip()
+        host = forwarded_host or self.headers.get("Host", "").strip() or "localhost"
+        head = [f"{self.command} {self.path} HTTP/1.1", f"Host: {host}"]
+        head += [f"{k}: {v}" for k, v in headers]
+        head += ["Connection: Upgrade", "Upgrade: websocket", "", ""]
+        try:
+            upstream = socket.create_connection(
+                (self.upstream_host, self.upstream_port),
+                timeout=WS_HANDSHAKE_TIMEOUT_SECONDS,
+            )
+        except OSError as exc:
+            log.warning("websocket upstream connect error: %s", exc)
+            self._safe_send_error(502, "Bad Gateway")
+            return
+        try:
+            try:
+                upstream.sendall("\r\n".join(head).encode("latin-1"))
+                response_head = b""
+                while b"\r\n\r\n" not in response_head:
+                    chunk = upstream.recv(65536)
+                    if not chunk:
+                        raise ConnectionError("upstream closed during handshake")
+                    response_head += chunk
+                    if len(response_head) > WS_MAX_RESPONSE_HEAD_BYTES:
+                        raise ConnectionError("upstream handshake response too large")
+            except (OSError, UnicodeEncodeError) as exc:
+                log.warning("websocket upstream handshake error: %s", exc)
+                self._safe_send_error(502, "Bad Gateway")
+                return
+            try:
+                # Relay the response (and any frames already read
+                # past it) as-is: a 101 carries the Upgrade and
+                # Sec-WebSocket-Accept headers the client checks, and
+                # a refusal (eg 401) is passed through for the client.
+                self.connection.sendall(response_head)
+            except OSError as exc:
+                log.debug("client disconnected during websocket handshake: %s", exc)
+                return
+            status_line = response_head.split(b"\r\n", 1)[0]
+            if b" 101 " not in status_line + b" ":
+                # Not upgraded: relay the rest of the response body.
+                upstream.settimeout(WS_HANDSHAKE_TIMEOUT_SECONDS)
+                self._pipe(upstream, self.connection)
+                return
+            # Long-lived from here: Jellyfin and its clients exchange
+            # keepalives, so idle gaps don't need a timeout.
+            upstream.settimeout(None)
+            self.connection.settimeout(None)
+            log.info("websocket tunnel open: %s", self.path.split("?", 1)[0])
+            to_client = threading.Thread(
+                target=self._pipe, args=(upstream, self.connection), daemon=True
+            )
+            to_client.start()
+            self._pipe_client_to(upstream)
+            to_client.join(timeout=5)
+            log.info("websocket tunnel closed: %s", self.path.split("?", 1)[0])
+        finally:
+            for sock in (upstream, self.connection):
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+            upstream.close()
+
+    def _pipe_client_to(self, dest: socket.socket) -> None:
+        """Client -> upstream.  Reads through rfile so any bytes it
+        already buffered past the request head aren't lost."""
+        try:
+            while True:
+                data = self.rfile.read1(65536)
+                if not data:
+                    break
+                dest.sendall(data)
+        except (OSError, ValueError):
+            pass
+        finally:
+            # Unblock the other direction.
+            try:
+                dest.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+    @staticmethod
+    def _pipe(src: socket.socket, dest: socket.socket) -> None:
+        try:
+            while True:
+                data = src.recv(65536)
+                if not data:
+                    break
+                dest.sendall(data)
+        except OSError:
+            pass
+        finally:
+            try:
+                dest.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
 
     def _proxy(self) -> None:
         cleaned_headers = _strip_headers(
