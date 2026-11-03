@@ -18,8 +18,6 @@ _HOME_URL = re.compile(r"/web/#/home")
 # Jellyfin's first boot plus bootstrap_admin.py can take minutes; the shim is only served once the token exists.
 _BOOT_TIMEOUT_SECONDS = 300
 _HOME_TIMEOUT_MS = 60_000
-# Text only the SSO shim page contains (auth_proxy._build_shim_html).
-_SHIM_MARKER = "Signing in to Jellyfin via OpenHost SSO"
 
 
 def _wait_for_admin_token(stack: OpenhostStack) -> dict[str, Any]:
@@ -62,11 +60,23 @@ def test_owner_lands_on_home(stack: OpenhostStack, page: Page) -> None:
     # Addresses follow how the browser reached the app (plain http in the harness, https on public zones).
     assert server["ManualAddress"] == _origin(page), server
 
-    # A later visit to / is not shimmed again: the seeded cookie survives (it is only Secure over https).
-    response = page.goto(f"{stack.url}/")
-    assert response is not None
-    assert _SHIM_MARKER not in response.text(), "the shim ran again on an already-seeded browser"
+    # A later visit to / is not shimmed again: the seeded cookie survives (it is only Secure over https). The shim
+    # answers / itself with a 200 and navigates away (so its body can't be read afterwards); once seeded, / is
+    # proxied and Jellyfin redirects it to /web/.
+    root_statuses: list[int] = []
+    page.on(
+        "response",
+        lambda r: (
+            root_statuses.append(r.status)
+            if r.request.resource_type == "document" and r.url.rstrip("/") == stack.url
+            else None
+        ),
+    )
+    page.goto(f"{stack.url}/")
     _expect_home(page, errors)
+    assert root_statuses and all(300 <= s < 400 for s in root_statuses), (
+        f"/ was not proxied to Jellyfin on an already-seeded browser (statuses {root_statuses}): the shim ran again"
+    )
 
 
 def test_reseeds_browser_seeded_by_old_shim(stack: OpenhostStack, page: Page) -> None:
