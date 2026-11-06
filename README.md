@@ -70,6 +70,13 @@ method: the first-boot wizard does not recreate it after setup is complete.
     → /Startup/Complete` then mints an access token via
     `POST /Users/AuthenticateByName`.
 
+## Prebuilt image
+
+`cloudinabottle.toml` sets `prebuilt_image`, so Cloud in a Bottle pulls our
+signed prebuilt image (built by CI from each release tag) instead of building
+the Dockerfile. To fork and modify this app, comment out `prebuilt_image` so
+your instance builds from source.
+
 ## Persistent state
 
 Working state lives under `$OPENHOST_APP_DATA_DIR/` (local NVMe, backed

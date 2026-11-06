@@ -1,11 +1,14 @@
 [app]
 name = "jellyfin"
-version = "0.1.0"
+version = "1.0.0"
 description = "Jellyfin (open-source media server) packaged for Cloud in a Bottle.  The Cloud in a Bottle zone owner is auto-signed-in to Jellyfin's web UI without ever seeing the password form; an HTML shim seeds Jellyfin's localStorage 'jellyfin_credentials' entry with a server-minted access token before bouncing to /web/."
 authors = ["Andrew Laack <andrew@laack.co>"]
 
 [runtime.container]
 image = "Dockerfile"
+# Cloud in a Bottle pulls this signed prebuilt image (built from the release tag's commit by CI) instead of building
+# `image`. If you fork this app and change it, comment this line out so your instance builds `image` instead.
+prebuilt_image = "registry.cloudinabottle.org/bottled-jellyfin"
 # auth-proxy port.  Jellyfin runs on 127.0.0.1:8096 inside the
 # container; the proxy listens on 8080 and is what the OpenHost
 # router forwards to.
