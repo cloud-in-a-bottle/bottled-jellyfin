@@ -1,6 +1,7 @@
 [app]
 name = "jellyfin"
-version = "1.0.0"
+version = "1.0.1"
+release_tag_format = "semver"
 description = "Jellyfin (open-source media server) packaged for Cloud in a Bottle.  The Cloud in a Bottle zone owner is auto-signed-in to Jellyfin's web UI without ever seeing the password form; an HTML shim seeds Jellyfin's localStorage 'jellyfin_credentials' entry with a server-minted access token before bouncing to /web/."
 authors = ["Andrew Laack <andrew@laack.co>"]
 
